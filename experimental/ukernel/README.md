@@ -4,9 +4,9 @@ Minimal build and test entry points for `experimental/ukernel`.
 
 ## Prerequisites
 
-- CUDA toolchain for NVIDIA builds
+- CUDA/Rocm toolchain for NVIDIA/AMD builds
 - RDMA / verbs dependencies used by `transport` and `ccl`
-- system-installed GDRCopy (`gdrapi.h` + `libgdrapi`) for `device` and `ccl`
+- system-installed GDRCopy (`gdrapi.h` + `libgdrapi`) for `device` and `ccl` (only Nvidia)
 - `torchrun` available for CCL multiprocess integration tests
 
 ## Quick Install GDRCopy (System)
@@ -77,9 +77,13 @@ Manual two-process transport check:
 ```bash
 cd experimental/ukernel/src/transport
 make test-integration
-./test_transport_integration communicator --role=server --case=exchange --exchanger-port 16979
-./test_transport_integration communicator --role=client --case=exchange --exchanger-ip 127.0.0.1 --exchanger-port 16979
+CUDA_VISIBLE_DEVICES=5,6 ./test_transport_integration communicator --role=server --case=exchange --transport ipc --exchanger-port 16979
+CUDA_VISIBLE_DEVICES=5,6 ./test_transport_integration communicator --role=client --case=exchange --transport ipc --exchanger-ip 127.0.0.1 --exchanger-port 16979
 ```
+
+For IPC checks, expose both peer GPUs to both processes. The transport
+integration test defaults to server `--gpu=0` and client `--gpu=1` within the
+visible device list; use `--gpu`/`--peer-gpu` to override.
 
 Run all device tests:
 
@@ -114,36 +118,70 @@ Run Python tests (requires 2+ GPUs):
 ```bash
 cd experimental/ukernel/py
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 test_collective.py
-CUDA_VISIBLE_DEVICES=0,6,7 torchrun --nproc_per_node=3 test_collective.py  # for 3-rank tests
 CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 test_p2p.py
 
 # rdma battle
-UK_P2P_TRANSPORT=uccl NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=0 NCCL_IB_HCA=mlx5_0 NCCL_DEBUG=INFO CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 bench_p2p.py
-        Size |  ukernel (ms) |  ukernel (GB/s) |   NCCL (ms) |   NCCL (GB/s)
-      1024 B |         0.225 |            0.01 |       0.121 |          0.02
-      4096 B |         0.265 |            0.03 |       0.123 |          0.07
-     16384 B |         0.345 |            0.10 |       0.200 |          0.16
-     65536 B |         0.407 |            0.32 |       0.201 |          0.65
-    262144 B |         0.576 |            0.91 |       0.383 |          1.37
-   1048576 B |         1.380 |            1.52 |       1.231 |          1.70
-   4194304 B |         5.127 |            1.64 |       4.428 |          1.89
-  16777216 B |        19.979 |            1.68 |      17.213 |          1.95
-  67108864 B |        79.735 |            1.68 |      68.675 |          1.95
- 268435456 B |       319.598 |            1.68 |     273.423 |          1.96
+UK_P2P_TRANSPORT=rdma UCCL_P2P_MODE=rdma NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=0 NCCL_IB_HCA=mlx5_0 NCCL_DEBUG=INFO CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 bench_p2p.py
+
+on Nvidia local:
+        Size |  ukernel (ms) |  ukernel (GB/s) |   UCCL (ms) |   UCCL (GB/s) |   NCCL (ms) |   NCCL (GB/s)
+--------------------------------------------------------------------------------------------------------------------------------
+      1024 B |         0.029 |            0.07 |       0.070 |          0.03 |       0.114 |          0.02
+      4096 B |         0.035 |            0.23 |       0.051 |          0.16 |       0.118 |          0.07
+     16384 B |         0.052 |            0.64 |       0.067 |          0.49 |       0.153 |          0.21
+     65536 B |         0.105 |            1.25 |       0.122 |          1.07 |       0.154 |          0.85
+    262144 B |         0.318 |            1.65 |       0.492 |          1.07 |       0.375 |          1.40
+   1048576 B |         1.139 |            1.84 |       1.210 |          1.73 |       1.235 |          1.70
+   4194304 B |         4.868 |            1.72 |       5.041 |          1.66 |       4.484 |          1.87
+  16777216 B |        19.267 |            1.74 |      19.755 |          1.70 |      17.446 |          1.92
+  67108864 B |        78.640 |            1.71 |      79.564 |          1.69 |      69.297 |          1.94
+ 268435456 B |       326.889 |            1.64 |     316.388 |          1.70 |     276.579 |          1.94
 
 # ipc battle
-CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 bench_p2p.py
-        Size |  ukernel (ms) |  ukernel (GB/s) |   NCCL (ms) |   NCCL (GB/s)
-      1024 B |         3.295 |            0.00 |       0.072 |          0.03
-      4096 B |         3.398 |            0.00 |       0.069 |          0.12
-     16384 B |         3.317 |            0.01 |       0.087 |          0.38
-     65536 B |         3.448 |            0.04 |       0.090 |          1.45
-    262144 B |         3.425 |            0.15 |       0.087 |          6.06
-   1048576 B |         3.615 |            0.58 |       0.114 |         18.40
-   4194304 B |         3.514 |            2.39 |       0.250 |         33.50
-  16777216 B |         3.794 |            8.84 |       0.794 |         42.26
-  67108864 B |         6.243 |           21.50 |       2.758 |         48.66
- 268435456 B |        13.531 |           39.68 |      10.814 |         49.65
+UK_P2P_TRANSPORT=ipc UCCL_P2P_MODE=ipc CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 bench_p2p.py
+
+on Nvidia local:
+        Size |  ukernel (ms) |  ukernel (GB/s) |   UCCL (ms) |   UCCL (GB/s) |   NCCL (ms) |   NCCL (GB/s)
+--------------------------------------------------------------------------------------------------------------------------------
+      1024 B |         0.020 |            0.10 |       0.027 |          0.08 |       0.069 |          0.03
+      4096 B |         0.019 |            0.43 |       0.026 |          0.32 |       0.069 |          0.12
+     16384 B |         0.018 |            1.80 |       0.027 |          1.24 |       0.070 |          0.47
+     65536 B |         0.019 |            6.73 |       0.029 |          4.60 |       0.069 |          1.90
+    262144 B |         0.027 |           19.35 |       0.035 |         15.19 |       0.071 |          7.34
+   1048576 B |         0.057 |           36.83 |       0.067 |         31.21 |       0.101 |         20.76
+   4194304 B |         0.184 |           45.71 |       0.192 |         43.62 |       0.249 |         33.69
+  16777216 B |         0.660 |           50.86 |       0.669 |         50.16 |       0.794 |         42.24
+  67108864 B |         2.570 |           52.21 |       2.583 |         51.95 |       2.757 |         48.68
+ 268435456 B |        10.185 |           52.71 |      10.199 |         52.64 |      10.815 |         49.64
+
+on AMD0:
+         Size |  ukernel (ms) |  ukernel (GB/s) |   UCCL (ms) |   UCCL (GB/s) |   NCCL (ms) |   NCCL (GB/s)
+--------------------------------------------------------------------------------------------------------------------------------
+      1024 B |         0.030 |            0.07 |       0.039 |          0.05 |       0.142 |          0.01
+      4096 B |         0.030 |            0.27 |       0.039 |          0.21 |       0.125 |          0.07
+     16384 B |         0.031 |            1.06 |       0.039 |          0.83 |       0.127 |          0.26
+     65536 B |         0.044 |            2.96 |       0.031 |          4.20 |       0.124 |          1.05
+    262144 B |         0.052 |           10.16 |       0.041 |         12.80 |       0.135 |          3.90
+   1048576 B |         0.083 |           25.39 |       0.073 |         28.70 |       0.146 |         14.39
+   4194304 B |         0.206 |           40.71 |       0.253 |         33.20 |       0.268 |         31.36
+  16777216 B |         0.697 |           48.13 |       0.764 |         43.90 |       0.758 |         44.27
+  67108864 B |         2.656 |           50.54 |       2.797 |         47.99 |       2.715 |         49.44
+ 268435456 B |        10.495 |           51.15 |      10.920 |         49.16 |      10.548 |         50.90
+
+# tcp
+UK_P2P_TRANSPORT=tcp UCCL_P2P_MODE=ipc CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 bench_p2p.py
+         Size |  ukernel (ms) |  ukernel (GB/s)
+------------------------------------------------------
+      1024 B |         3.318 |            0.00
+      4096 B |         3.470 |            0.00
+     16384 B |         3.339 |            0.01
+     65536 B |         3.410 |            0.04
+    262144 B |         3.439 |            0.15
+   1048576 B |         3.602 |            0.58
+   4194304 B |         3.679 |            2.28
+  16777216 B |         4.104 |            8.18
+  67108864 B |         6.058 |           22.15
+ 268435456 B |        13.548 |           39.63
 ```
 
 Minimal usage under `torchrun`:

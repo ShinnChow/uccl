@@ -17,12 +17,13 @@ fifo_blob_size = 64  # bytes
 
 
 def _make_buffer(n_bytes: int, device: str, gpu: int):
-    n = n_bytes // 4
+    if n_bytes <= 0:
+        raise ValueError(f"buffer size must be positive, got {n_bytes}")
     if device == "gpu":
-        buf = torch.ones(n, dtype=torch.float32, device=f"cuda:{gpu}")
+        buf = torch.ones(n_bytes, dtype=torch.uint8, device=f"cuda:{gpu}")
         ptr = buf.data_ptr()
     else:
-        buf = torch.ones(n, dtype=torch.float32, pin_memory=True)
+        buf = torch.ones(n_bytes, dtype=torch.uint8, pin_memory=True)
         ptr = buf.data_ptr()
     return buf, ptr
 
@@ -132,7 +133,7 @@ def _run_client(args, ep, remote_metadata):
     ip, port, r_gpu = p2p.Endpoint.parse_metadata(remote_metadata)
     ok, conn_id = ep.connect(ip, r_gpu, remote_port=port)
     assert ok
-    print(f"[Client] Connected to {ip}:{port} id={conn_id}")
+    print(f"[Client] Connected to {ip}:{port} (GPU {r_gpu}) id={conn_id}")
 
     for sz in args.sizes:
         if args.lazy:
@@ -302,7 +303,7 @@ def main():
             104857600,
         ],
     )
-    p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--iters", type=int, default=100)
     p.add_argument("--async-api", action="store_true")
     p.add_argument(
         "--num-iovs",

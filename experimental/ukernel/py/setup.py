@@ -2,7 +2,8 @@ import os
 from pathlib import Path
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
 
 try:
     import nanobind
@@ -16,16 +17,40 @@ except ImportError as exc:
 ROOT = Path(__file__).resolve().parent.parent
 UCCL_ROOT = ROOT.parent.parent
 CUDA_HOME = Path("/usr/local/cuda")
+ROCM_HOME = Path(os.environ.get("ROCM_HOME", "/opt/rocm"))
+USE_ROCM = getattr(torch.version, "hip", None) is not None
+
+
 GDRCOPY_INCLUDE_DIR = Path(
     os.environ.get("GDRCOPY_INCLUDE_DIR", "/usr/local/include")
 )
 GDRCOPY_LIBDIR = os.environ.get("GDRCOPY_LIBDIR", "").strip()
-RDMA_STATIC = UCCL_ROOT / "collective" / "rdma" / "librdma.a"
+RDMA_STATIC = (
+    UCCL_ROOT / "collective" / "rdma" / ("librdma_hip.a" if USE_ROCM else "librdma.a")
+)
 NANOBIND_ROOT = Path(nanobind.__file__).resolve().parent
 
 
 def rel(path: Path) -> str:
     return str(path.resolve())
+
+
+transport_sources = [
+    rel(ROOT / "src" / "transport" / "communicator.cc"),
+    rel(ROOT / "src" / "transport" / "request_tracker.cc"),
+    rel(ROOT / "src" / "transport" / "bounce_buffer_pool.cc"),
+    rel(ROOT / "src" / "transport" / "memory" / "mr_manager.cc"),
+    rel(ROOT / "src" / "transport" / "memory" / "ipc_manager.cc"),
+    rel(ROOT / "src" / "transport" / "memory" / "shm_manager.cc"),
+    rel(ROOT / "src" / "transport" / "oob" / "oob.cc"),
+    rel(ROOT / "src" / "transport" / "oob" / "oob_socket.cc"),
+    rel(ROOT / "src" / "transport" / "adapter" / "ipc_adapter.cc"),
+    rel(ROOT / "src" / "transport" / "adapter" / "shmring_exchanger.cc"),
+    rel(ROOT / "src" / "transport" / "adapter" / "tcp_adapter.cc"),
+    rel(ROOT / "src" / "transport" / "adapter" / "uccl_adapter.cc"),
+    rel(ROOT / "src" / "transport" / "adapter" / "rdma_adapter.cc"),
+    rel(ROOT / "src" / "transport" / "util" / "utils.cc"),
+]
 
 
 sources = [
@@ -38,18 +63,7 @@ sources = [
     rel(ROOT / "src" / "ccl" / "plan.cc"),
     rel(ROOT / "src" / "ccl" / "selector.cc"),
     rel(ROOT / "src" / "ccl" / "topology.cc"),
-    rel(ROOT / "src" / "transport" / "communicator.cc"),
-    rel(ROOT / "src" / "transport" / "memory" / "mr_manager.cc"),
-    rel(ROOT / "src" / "transport" / "memory" / "ipc_manager.cc"),
-    rel(ROOT / "src" / "transport" / "memory" / "shm_manager.cc"),
-    rel(ROOT / "src" / "transport" / "oob" / "oob.cc"),
-    rel(ROOT / "src" / "transport" / "oob" / "oob_shm.cc"),
-    rel(ROOT / "src" / "transport" / "oob" / "oob_socket.cc"),
-    rel(ROOT / "src" / "transport" / "request.cc"),
-    rel(ROOT / "src" / "transport" / "adapter" / "tcp_adapter.cc"),
-    rel(ROOT / "src" / "transport" / "adapter" / "uccl_adapter.cc"),
-    rel(ROOT / "src" / "transport" / "adapter" / "ipc_adapter.cc"),
-    rel(ROOT / "src" / "transport" / "util" / "utils.cc"),
+    *transport_sources,
     rel(ROOT / "src" / "device" / "fifo" / "c2d_fifo.cc"),
     rel(ROOT / "src" / "device" / "fifo" / "d2c_fifo.cpp"),
     rel(ROOT / "src" / "device" / "fifo" / "sm_fifo.cc"),
@@ -60,18 +74,7 @@ sources = [
 p2p_sources = [
     rel(ROOT / "py" / "ukernel_p2p.cpp"),
     rel(NANOBIND_ROOT / "src" / "nb_combined.cpp"),
-    rel(ROOT / "src" / "transport" / "communicator.cc"),
-    rel(ROOT / "src" / "transport" / "memory" / "mr_manager.cc"),
-    rel(ROOT / "src" / "transport" / "memory" / "ipc_manager.cc"),
-    rel(ROOT / "src" / "transport" / "memory" / "shm_manager.cc"),
-    rel(ROOT / "src" / "transport" / "oob" / "oob.cc"),
-    rel(ROOT / "src" / "transport" / "oob" / "oob_shm.cc"),
-    rel(ROOT / "src" / "transport" / "oob" / "oob_socket.cc"),
-    rel(ROOT / "src" / "transport" / "request.cc"),
-    rel(ROOT / "src" / "transport" / "adapter" / "tcp_adapter.cc"),
-    rel(ROOT / "src" / "transport" / "adapter" / "uccl_adapter.cc"),
-    rel(ROOT / "src" / "transport" / "adapter" / "ipc_adapter.cc"),
-    rel(ROOT / "src" / "transport" / "util" / "utils.cc"),
+    *transport_sources,
 ]
 
 include_dirs = [
@@ -86,127 +89,143 @@ include_dirs = [
     rel(UCCL_ROOT / "collective" / "rdma"),
     rel(UCCL_ROOT / "include"),
     str(GDRCOPY_INCLUDE_DIR),
-    str(CUDA_HOME / "include"),
+    "/usr/local/include",
+    "/usr/include",
 ]
+if USE_ROCM:
+    include_dirs.append(str(ROCM_HOME / "include"))
+else:
+    include_dirs.append(str(CUDA_HOME / "include"))
 
-library_dirs = [
-    str(CUDA_HOME / "lib64"),
-    "/usr/local/lib",
-    "/usr/lib",
-    "/usr/lib64",
-]
-runtime_library_dirs = [str(CUDA_HOME / "lib64")]
+library_dirs = ["/usr/local/lib", "/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"]
+runtime_library_dirs = []
+if USE_ROCM:
+    library_dirs.append(str(ROCM_HOME / "lib"))
+    runtime_library_dirs.append(str(ROCM_HOME / "lib"))
+else:
+    library_dirs.append(str(CUDA_HOME / "lib64"))
+    runtime_library_dirs.append(str(CUDA_HOME / "lib64"))
 if GDRCOPY_LIBDIR:
     library_dirs.append(GDRCOPY_LIBDIR)
     runtime_library_dirs.append(str(Path(GDRCOPY_LIBDIR).resolve()))
 
-ext = CUDAExtension(
-    name="ukernel_ccl._C",
+common_cxx_args = [
+    "-O3",
+    "-std=c++17",
+    "-Wall",
+    "-Wno-unused-function",
+    "-Wno-sign-compare",
+    "-Wno-reorder",
+    "-Wno-unused-variable",
+    "-Wno-unused-label",
+    "-Wno-unused-but-set-variable",
+    "-Wno-stringop-overread",
+    "-Wno-narrowing",
+    "-pthread",
+    "-fPIC",
+    "-DUKERNEL_ENABLE_TMA=0",
+]
+if USE_ROCM:
+    common_cxx_args.extend(["-D__HIP_PLATFORM_AMD__", "-DUSE_ROCM=1", "-DHIPBLAS_V2"])
+
+cuda_nvcc_args = [
+    "-O3",
+    "-std=c++20",
+    "--expt-extended-lambda",
+    "--expt-relaxed-constexpr",
+    "-DKITTENS_HOPPER",
+    "-DUKERNEL_ENABLE_TMA=0",
+    "-gencode",
+    "arch=compute_80,code=sm_80",
+    "-gencode",
+    "arch=compute_86,code=sm_86",
+    "-gencode",
+    "arch=compute_89,code=sm_89",
+]
+
+if USE_ROCM:
+    os.environ.setdefault("CUDA_HOME", str(ROCM_HOME))
+ExtensionCls = CUDAExtension
+
+common_libraries = [
+    "gflags",
+    "z",
+    "ibverbs",
+    "nl-3",
+    "nl-route-3",
+    "pthread",
+    "numa",
+]
+if USE_ROCM:
+    library_dirs.append(str(RDMA_STATIC.parent.resolve()))
+    common_libraries.extend(["amdhip64", "elf", "dl", "rdma_hip"])
+else:
+    library_dirs.append(str(RDMA_STATIC.parent.resolve()))
+    common_libraries.extend(["cudart", "cuda", "gdrapi", "rdma"])
+
+extra_link_args = []
+
+
+extension_kwargs = dict(
     sources=sources,
     include_dirs=include_dirs,
-    extra_compile_args={
-        "cxx": [
+    library_dirs=library_dirs,
+    libraries=common_libraries,
+    extra_link_args=extra_link_args,
+    runtime_library_dirs=runtime_library_dirs,
+)
+if USE_ROCM:
+    extension_kwargs["extra_compile_args"] = {
+        "cxx": common_cxx_args,
+        "nvcc": [
             "-O3",
             "-std=c++17",
             "-Wall",
-            "-Wno-unused-function",
             "-Wno-sign-compare",
             "-Wno-reorder",
             "-Wno-unused-variable",
             "-Wno-unused-label",
             "-Wno-unused-but-set-variable",
-            "-Wno-stringop-overread",
             "-Wno-narrowing",
             "-pthread",
             "-fPIC",
+            "-D__HIP_PLATFORM_AMD__",
             "-DUKERNEL_ENABLE_TMA=0",
         ],
-        "nvcc": [
-            "-O3",
-            "-std=c++20",
-            "--expt-extended-lambda",
-            "--expt-relaxed-constexpr",
-            "-DKITTENS_HOPPER",
-            "-DUKERNEL_ENABLE_TMA=0",
-            "-gencode",
-            "arch=compute_80,code=sm_80",
-            "-gencode",
-            "arch=compute_86,code=sm_86",
-            "-gencode",
-            "arch=compute_89,code=sm_89",
-        ],
-    },
-    library_dirs=library_dirs,
-    libraries=[
-        "cudart",
-        "cuda",
-        "gflags",
-        "z",
-        "ibverbs",
-        "nl-3",
-        "nl-route-3",
-        "pthread",
-        "rdmacm",
-        "gdrapi",
-        "numa",
-    ],
-    extra_objects=[str(RDMA_STATIC.resolve())],
-    runtime_library_dirs=runtime_library_dirs,
+    }
+else:
+    extension_kwargs["extra_compile_args"] = {
+        "cxx": common_cxx_args,
+        "nvcc": cuda_nvcc_args,
+    }
+
+ext = ExtensionCls(
+    name="ukernel_ccl._C",
+    **extension_kwargs,
 )
 
-p2p_ext = CUDAExtension(
-    name="ukernel_p2p._C",
+p2p_extension_kwargs = dict(
     sources=p2p_sources,
     include_dirs=include_dirs,
-    extra_compile_args={
-        "cxx": [
-            "-O3",
-            "-std=c++17",
-            "-Wall",
-            "-Wno-unused-function",
-            "-Wno-sign-compare",
-            "-Wno-reorder",
-            "-Wno-unused-variable",
-            "-Wno-unused-label",
-            "-Wno-unused-but-set-variable",
-            "-Wno-stringop-overread",
-            "-Wno-narrowing",
-            "-pthread",
-            "-fPIC",
-            "-DUKERNEL_ENABLE_TMA=0",
-        ],
-        "nvcc": [
-            "-O3",
-            "-std=c++20",
-            "--expt-extended-lambda",
-            "--expt-relaxed-constexpr",
-            "-DKITTENS_HOPPER",
-            "-DUKERNEL_ENABLE_TMA=0",
-            "-gencode",
-            "arch=compute_80,code=sm_80",
-            "-gencode",
-            "arch=compute_86,code=sm_86",
-            "-gencode",
-            "arch=compute_89,code=sm_89",
-        ],
-    },
     library_dirs=library_dirs,
-    libraries=[
-        "cudart",
-        "cuda",
-        "gflags",
-        "z",
-        "ibverbs",
-        "nl-3",
-        "nl-route-3",
-        "pthread",
-        "rdmacm",
-        "gdrapi",
-        "numa",
-    ],
-    extra_objects=[str(RDMA_STATIC.resolve())],
+    libraries=common_libraries,
+    extra_link_args=extra_link_args,
     runtime_library_dirs=runtime_library_dirs,
 )
+if USE_ROCM:
+    p2p_extension_kwargs["extra_compile_args"] = extension_kwargs["extra_compile_args"]
+else:
+    p2p_extension_kwargs["extra_compile_args"] = {
+        "cxx": common_cxx_args,
+        "nvcc": cuda_nvcc_args,
+    }
+
+p2p_ext = ExtensionCls(
+    name="ukernel_p2p._C",
+    **p2p_extension_kwargs,
+)
+
+ext_modules = [ext, p2p_ext]
 
 
 setup(
@@ -214,6 +233,6 @@ setup(
     version="0.1.0",
     packages=["ukernel_ccl", "ukernel_p2p"],
     package_dir={"ukernel_ccl": "ukernel_ccl", "ukernel_p2p": "ukernel_p2p"},
-    ext_modules=[ext, p2p_ext],
+    ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

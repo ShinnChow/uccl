@@ -3,6 +3,29 @@
 namespace UKernel {
 namespace Transport {
 
+bool Exchanger::wait_raw(std::string_view key, std::string& value,
+                         WaitOptions const& options) {
+  if (options.max_retries == 0) {
+    return get_raw(key, value);
+  }
+
+  int const delay_ms = options.delay_ms > 0 ? options.delay_ms : 1;
+  if (options.max_retries > 0) {
+    for (int i = 0; i < options.max_retries; ++i) {
+      if (!valid()) return false;
+      if (get_raw(key, value)) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    }
+    return false;
+  }
+
+  while (valid()) {
+    if (get_raw(key, value)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+  }
+  return false;
+}
+
 char const* peer_transport_kind_name(PeerTransportKind kind) {
   switch (kind) {
     case PeerTransportKind::Unknown:
@@ -13,6 +36,8 @@ char const* peer_transport_kind_name(PeerTransportKind kind) {
       return "ipc";
     case PeerTransportKind::Tcp:
       return "tcp";
+    case PeerTransportKind::Rdma:
+      return "rdma";
   }
   return "unknown";
 }
@@ -36,6 +61,13 @@ PeerTransportKind resolve_peer_transport_kind(
   }
   if (config.preferred_transport == PreferredTransport::Tcp) {
     return PeerTransportKind::Tcp;
+  }
+  if (config.preferred_transport == PreferredTransport::Rdma) {
+    if (!local_meta.rdma_capable || !peer_meta.rdma_capable) {
+      throw std::invalid_argument(
+          "preferred RDMA transport requires RDMA-capable peers");
+    }
+    return PeerTransportKind::Rdma;
   }
   if (local_meta.host_id == peer_meta.host_id) {
     return PeerTransportKind::Ipc;

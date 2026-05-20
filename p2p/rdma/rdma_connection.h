@@ -3,6 +3,9 @@
 #include "define.h"
 #include "rdma_ctrl_channel.h"
 #include "rdma_data_channel.h"
+#include <cc/cc_state.h>
+#include <cc/link_bandwidth.h>
+#include <optional>
 #include <random>
 
 class RDMAConnection {
@@ -96,19 +99,68 @@ class RDMAConnection {
     return {random_id, context_id};
   }
 
+  // Lock-free hot-path channel cache. `channels_` is append-only during
+  // connection setup, so once cached the snapshot stays valid for the
+  // connection's lifetime. Falls back through the locked path if not built.
+  RDMADataChannel* getChannelFast(uint32_t channel_id) const {
+    if (likely(fast_channels_ready_.load(std::memory_order_acquire))) {
+      if (likely(channel_id >= 1 &&
+                 channel_id <=
+                     fast_channel_count_.load(std::memory_order_relaxed))) {
+        return fast_channels_[channel_id - 1];
+      }
+    }
+    auto sp = getChannel(channel_id);
+    return sp.get();
+  }
+
+  // Select next channel via round-robin without acquiring `mutex_` in the
+  // common case. Returns (channel_id, channel_ptr); on first call this
+  // primes the cache under a shared lock.
+  std::pair<uint32_t, RDMADataChannel*> selectNextChannelRoundRobinFast() {
+    if (unlikely(!fast_channels_ready_.load(std::memory_order_acquire))) {
+      buildFastChannelCache();
+    }
+    size_t n = fast_channel_count_.load(std::memory_order_relaxed);
+    if (unlikely(n == 0)) return {0, nullptr};
+    uint32_t prev = last_channel_id_.load(std::memory_order_relaxed);
+    uint32_t next = (prev % n) + 1;
+    last_channel_id_.store(next, std::memory_order_relaxed);
+    return {next, fast_channels_[next - 1]};
+  }
+
  protected:
+  void buildFastChannelCache() {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    size_t n = channels_.size();
+    fast_channels_.assign(n, nullptr);
+    for (auto const& [cid, ch] : channels_) {
+      if (cid >= 1 && cid <= n) fast_channels_[cid - 1] = ch.get();
+    }
+    fast_channel_count_.store(n, std::memory_order_release);
+    fast_channels_ready_.store(true, std::memory_order_release);
+  }
+
   mutable std::shared_mutex mutex_;
   std::unordered_map<uint32_t, std::shared_ptr<RDMADataChannel>> channels_;
   std::atomic<uint32_t> last_channel_id_;
+
+  // Lock-free channel pointer cache (populated lazily on first hot-path use).
+  mutable std::vector<RDMADataChannel*> fast_channels_;
+  mutable std::atomic<size_t> fast_channel_count_{0};
+  mutable std::atomic<bool> fast_channels_ready_{false};
 };
 
 class SendConnection : public RDMAConnection {
  public:
-  SendConnection(int numa_node, bool auto_start_polling = true)
+  SendConnection(int numa_node, bool auto_start_polling = true,
+                 double link_bandwidth_bps = 400.0 * 1e9 / 8.0)
       : numa_node_(numa_node),
         running_(false),
         poll_thread_(nullptr),
-        auto_start_polling_(auto_start_polling) {
+        auto_start_polling_(auto_start_polling),
+        cc_(uccl::cc::CongestionControlState::parseMode("UCCL_P2P_RDMA_CC"),
+            uccl::freq_ghz, link_bandwidth_bps) {
     tracker_ = std::make_shared<AtomicBitmapPacketTrackerMultiAck>();
     request_queue_ = std::make_unique<
         RingBuffer<std::shared_ptr<RDMASendRequest>, kRingCapacity>>();
@@ -158,12 +210,15 @@ class SendConnection : public RDMAConnection {
   }
 
   int64_t send(std::shared_ptr<RDMASendRequest> req) {
-    int64_t wr_id = tracker_->sendPacket(req->getLocalLen());
+    // Allocate seq_num without counting bytes — actual size is registered
+    // later by the polling thread after popping from the queue, so that
+    // getTotalInflightBytes() only reflects requests actually being sent.
+    int64_t wr_id = tracker_->sendPacket(0);
     req->wr_id = wr_id;
-    if (unlikely(request_queue_->push(req) < 0)) {
+    while (unlikely(request_queue_->push(req) < 0)) {
       UCCL_LOG(WARN) << "SendConnection: isend request queue is full, wr_id="
                      << wr_id;
-      return -1;
+      std::this_thread::yield();
     }
     return wr_id;
   }
@@ -175,18 +230,63 @@ class SendConnection : public RDMAConnection {
                          "SendType::Write";
       return -1;
     }
+
+    // Enforce CC window before posting
+    if (cc_.enabled()) {
+      size_t inflight_limit_bytes = currentInflightLimitBytes();
+      while (currentInflightBytes() > inflight_limit_bytes) {
+        std::this_thread::yield();
+        inflight_limit_bytes = currentInflightLimitBytes();
+      }
+    }
+
     std::shared_lock<std::shared_mutex> lock(ctrl_channel_mutex_);
     int64_t wr_id = tracker_->sendPacket(req->getLocalLen());
     req->wr_id = wr_id;
 
-    auto [channel_id, context_id] = selectNextChannelRoundRobin();
-    if (unlikely(channel_id == 0)) {
+    // Lock-free channel selection + direct pointer.
+    auto [channel_id, ch_ptr] = selectNextChannelRoundRobinFast();
+    if (unlikely(channel_id == 0 || ch_ptr == nullptr)) {
       UCCL_LOG(ERROR) << "SendConnection::write - Failed to select channel";
       return -1;
     }
 
     req->channel_id = channel_id;
+
+    // Fast single-chunk path: skip postChunkedRequest/postSingleChunk and
+    // submit directly to the resolved channel pointer.
+    if (likely(ChunkSplitStrategy::getMessageChunkCount(req->local_mem->size) ==
+               1)) {
+      req->imm_data.set_chunk_count(1);
+
+      int64_t saved_wr_id = req->wr_id;
+      if (cc_.enabled()) {
+        uint32_t tsc_id =
+            chunk_tsc_counter_.fetch_add(1, std::memory_order_relaxed);
+        req->wr_id = (static_cast<int64_t>(tsc_id) << 32) |
+                     static_cast<uint32_t>(req->wr_id);
+        cc_.recordSendTsc(tsc_id);
+      }
+
+      int64_t send_ret = ch_ptr->submitRequest(req);
+      req->wr_id = saved_wr_id;
+
+      if (send_ret >= 0 && cc_.enabled()) {
+        cc_inflight_bytes_.fetch_add(req->getLocalLen(),
+                                     std::memory_order_relaxed);
+      }
+      return wr_id;
+    }
+
     postChunkedRequest(req);
+
+    // Since postChunkedRequest() is non-blocking — if the CC
+    // window is exhausted mid-message it saves the remaining chunks
+    // and returns immediately.
+    // Draining them here.
+    while (!drainPendingChunks()) {
+      std::this_thread::yield();
+    }
 
     return wr_id;
   }
@@ -197,6 +297,16 @@ class SendConnection : public RDMAConnection {
                          "SendType::Read";
       return -1;
     }
+
+    // Enforce CC window before posting
+    if (cc_.enabled()) {
+      size_t inflight_limit_bytes = currentInflightLimitBytes();
+      while (currentInflightBytes() > inflight_limit_bytes) {
+        std::this_thread::yield();
+        inflight_limit_bytes = currentInflightLimitBytes();
+      }
+    }
+
     std::shared_lock<std::shared_mutex> lock(ctrl_channel_mutex_);
     int64_t wr_id = tracker_->sendPacket(req->getLocalLen());
     req->wr_id = wr_id;
@@ -209,6 +319,11 @@ class SendConnection : public RDMAConnection {
 
     req->channel_id = channel_id;
     postChunkedRequest(req);
+
+    // Draining any remaining chunks, as in postWriteOrRead()
+    while (!drainPendingChunks()) {
+      std::this_thread::yield();
+    }
 
     return wr_id;
   }
@@ -248,6 +363,11 @@ class SendConnection : public RDMAConnection {
     if (unlikely(ctrl_channel_ == nullptr)) {
       return -1;
     }
+    // Enforce CC window before accepting a new request
+    size_t inflight_limit_bytes = currentInflightLimitBytes();
+    if (currentInflightBytes() > inflight_limit_bytes) {
+      return -1;
+    }
     SendReqMeta meta;
     std::shared_lock<std::shared_mutex> lock(ctrl_channel_mutex_);
     int index = ctrl_channel_->getOneSendRequestMeta(meta);
@@ -262,6 +382,16 @@ class SendConnection : public RDMAConnection {
     return wr_id;
   }
 
+  // Flush any batched send WRs on all channels of this connection. Used to
+  // amortize doorbell cost across many small RDMA writes/reads posted via
+  // g_uccl_batch_post.
+  void flushBatches() {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto& [cid, channel] : channels_) {
+      if (channel) channel->flushBatch();
+    }
+  }
+
  private:
   std::shared_ptr<SendControlChannel> ctrl_channel_;
   mutable std::shared_mutex ctrl_channel_mutex_;
@@ -273,6 +403,32 @@ class SendConnection : public RDMAConnection {
   bool auto_start_polling_;
   int numa_node_ = 0;
 
+  uccl::cc::CongestionControlState cc_;
+  std::atomic<uint32_t> chunk_tsc_counter_{0};
+  // Per-chunk inflight byte counter for CC window checks.
+  // Unlike tracker_->getTotalInflightBytes() which only decreases when ALL
+  // chunks of a message are acked, this counter decreases on each chunk CQE.
+  std::atomic<size_t> cc_inflight_bytes_{0};
+
+  // Pending chunked request state for per-chunk CC pacing.
+  struct PendingChunkedState {
+    std::shared_ptr<RDMASendRequest> req;
+    std::vector<MessageChunk> chunks;
+    size_t next_chunk_idx = 0;
+    int remaining_expected_count = 0;
+  };
+  std::optional<PendingChunkedState> pending_chunked_;
+
+  inline size_t currentInflightLimitBytes() {
+    return cc_.enabled() ? cc_.getWindowBytes() : kInFlightMaxSizeKB * 1024;
+  }
+
+  // Return the inflight byte count, depends on CC enablement status
+  inline size_t currentInflightBytes() {
+    return cc_.enabled() ? cc_inflight_bytes_.load(std::memory_order_relaxed)
+                         : tracker_->getTotalInflightBytes();
+  }
+
   // Send a request through the appropriate channel
   // Returns true on success, false on failure
   bool postRequestOnChannel(std::shared_ptr<RDMASendRequest> req) {
@@ -283,7 +439,26 @@ class SendConnection : public RDMAConnection {
       return false;
     }
 
+    // Per-chunk CC: assign a unique TSC ID and record send timestamp
+    // close to the actual ibv_post_send.  The TSC ID is encoded in the
+    // upper 32 bits of wr_id; the lower 32 bits keep the message seq
+    // used by the tracker.  We save/restore req->wr_id so that callers
+    // (e.g. updateExpectedAckCount) still see the original message seq.
+    int64_t saved_wr_id = req->wr_id;
+    if (cc_.enabled()) {
+      uint32_t tsc_id =
+          chunk_tsc_counter_.fetch_add(1, std::memory_order_relaxed);
+      req->wr_id = (static_cast<int64_t>(tsc_id) << 32) |
+                   static_cast<uint32_t>(req->wr_id);
+      cc_.recordSendTsc(tsc_id);
+    }
+
     int64_t send_ret = channel->submitRequest(req);
+    req->wr_id = saved_wr_id;
+    if (send_ret >= 0 && cc_.enabled()) {
+      cc_inflight_bytes_.fetch_add(req->getLocalLen(),
+                                   std::memory_order_relaxed);
+    }
     if (send_ret < 0) {
       UCCL_LOG(WARN) << "SendConnection: Failed to send on channel_id "
                      << req->channel_id;
@@ -304,9 +479,86 @@ class SendConnection : public RDMAConnection {
     }
   }
 
+  // Build and post a single chunk from a split message.
+  bool postSingleChunk(std::shared_ptr<RDMASendRequest> const& req,
+                       MessageChunk const& chunk, size_t chunk_index,
+                       size_t total_chunks, size_t num_channels,
+                       int& expected_chunk_count) {
+    uint32_t chunk_channel_id =
+        ((req->channel_id - 1 + chunk_index) % num_channels) + 1;
+
+    auto chunk_local_mem = std::make_shared<RegMemBlock>(
+        static_cast<char*>(req->local_mem->addr) + chunk.offset, chunk.size,
+        req->local_mem->mr_array, req->local_mem->type);
+
+    auto chunk_remote_mem = std::make_shared<RemoteMemInfo>(
+        req->remote_mem->addr + chunk.offset, chunk.size,
+        req->remote_mem->rkey_array, req->remote_mem->type);
+
+    bool is_last_chunk = (chunk_index == total_chunks - 1);
+    auto chunk_req = std::make_shared<RDMASendRequest>(
+        chunk_local_mem, chunk_remote_mem, req->imm_data, is_last_chunk);
+
+    // Due to compression, the chunk count may differ from the original
+    // split, so set the expected chunk count for each chunk request.
+    if (expected_chunk_count > 0) {
+      if (is_last_chunk && expected_chunk_count > 1) {
+        chunk_req->imm_data.set_chunk_count(expected_chunk_count);
+      } else {
+        chunk_req->imm_data.set_chunk_count(1);
+      }
+      expected_chunk_count -= 1;
+    }
+
+    chunk_req->channel_id = chunk_channel_id;
+    chunk_req->from_rank_id = req->from_rank_id;
+    chunk_req->to_rank_id = req->to_rank_id;
+    chunk_req->wr_id = req->wr_id;
+    chunk_req->send_type = req->send_type;
+
+    return postRequestOnChannel(chunk_req);
+  }
+
+  // Post remaining chunks from a previously paused request.
+  // Returns true if all chunks are sent, false if still CC-blocked.
+  bool drainPendingChunks() {
+    if (!pending_chunked_) return true;
+
+    auto& ps = *pending_chunked_;
+    size_t num_channels = normalChannelCount();
+
+    while (ps.next_chunk_idx < ps.chunks.size()) {
+      // Per-chunk CC: check window before each chunk.
+      if (cc_.enabled()) {
+        size_t inflight_limit_bytes = currentInflightLimitBytes();
+        if (currentInflightBytes() > inflight_limit_bytes) {
+          return false;  // Yield back to polling loop.
+        }
+      }
+
+      if (!postSingleChunk(ps.req, ps.chunks[ps.next_chunk_idx],
+                           ps.next_chunk_idx, ps.chunks.size(), num_channels,
+                           ps.remaining_expected_count)) {
+        UCCL_LOG(WARN) << "SendConnection: Failed to send pending chunk "
+                       << ps.next_chunk_idx;
+      }
+      ps.next_chunk_idx++;
+    }
+
+    pending_chunked_.reset();
+    return true;
+  }
+
   void postChunkedRequest(std::shared_ptr<RDMASendRequest> req,
                           int expected_chunk_count = 0) {
-    if (expected_chunk_count == 1) {
+    // Fast path: single-chunk message. The default caller passes
+    // expected_chunk_count=0, in which case we compute chunk count from the
+    // message size; for messages that fit in a single chunk we post `req`
+    // directly and skip the chunk-wrapper allocations done by
+    // postSingleChunk().
+    if (expected_chunk_count == 1 ||
+        (expected_chunk_count == 0 &&
+         ChunkSplitStrategy::getMessageChunkCount(req->local_mem->size) == 1)) {
       req->imm_data.set_chunk_count(1);
       if (!postRequestOnChannel(req)) {
         UCCL_LOG(WARN)
@@ -328,59 +580,19 @@ class SendConnection : public RDMAConnection {
     size_t num_channels = normalChannelCount();
 
     for (size_t i = 0; i < chunks.size(); ++i) {
-      auto const& chunk = chunks[i];
-
-      // Use different channel for each chunk: round-robin
-      uint32_t chunk_channel_id =
-          ((req->channel_id - 1 + i) % num_channels) + 1;
-
-      // Create RegMemBlock for this chunk
-      auto chunk_local_mem = std::make_shared<RegMemBlock>(
-          static_cast<char*>(req->local_mem->addr) + chunk.offset, chunk.size,
-          req->local_mem->mr_array, req->local_mem->type);
-
-      // Create RemoteMemInfo for this chunk
-      auto chunk_remote_mem = std::make_shared<RemoteMemInfo>(
-          req->remote_mem->addr + chunk.offset, chunk.size,
-          req->remote_mem->rkey_array, req->remote_mem->type);
-
-      // Create send request for this chunk
-      // Only the last chunk needs signaled for completion notification
-      bool is_last_chunk = (i == chunks.size() - 1);
-      auto chunk_req = std::make_shared<RDMASendRequest>(
-          chunk_local_mem, chunk_remote_mem, req->imm_data, is_last_chunk);
-
-      // due to the compression, the chunk count may be different from the
-      // original split, so we need to set the expected chunk count for each
-      // chunk request
-      if (expected_chunk_count > 0) {
-        if (is_last_chunk && expected_chunk_count > 1) {
-          chunk_req->imm_data.set_chunk_count(expected_chunk_count);
-        } else {
-          chunk_req->imm_data.set_chunk_count(1);
+      // Per-chunk CC: if over budget, save remaining chunks and return.
+      if (cc_.enabled()) {
+        size_t inflight_limit_bytes = currentInflightLimitBytes();
+        if (currentInflightBytes() > inflight_limit_bytes) {
+          pending_chunked_ = PendingChunkedState{req, std::move(chunks), i,
+                                                 expected_chunk_count};
+          return;
         }
-        expected_chunk_count -= 1;
       }
 
-      chunk_req->channel_id = chunk_channel_id;
-      chunk_req->from_rank_id = req->from_rank_id;
-      chunk_req->to_rank_id = req->to_rank_id;
-      chunk_req->wr_id = req->wr_id;
-      // Inherit the send type from the original request.
-      chunk_req->send_type = req->send_type;
-      // Send the chunk
-      if (postRequestOnChannel(chunk_req)) {
-        // UCCL_LOG(INFO, UCCL_RDMA) << "SendConnection: Sent chunk " << i <<
-        // "/"
-        //           << chunks.size() << " (offset: " << chunk.offset
-        //           << ", size: " << chunk.size
-        //           << ", channel_id: " << chunk_channel_id << ")" <<
-        //           std::endl;
-      } else {
-        UCCL_LOG(WARN) << "SendConnection: Failed to send chunk " << i
-                       << " (offset: " << chunk.offset
-                       << ", size: " << chunk.size
-                       << ", channel_id: " << chunk_channel_id << ")";
+      if (!postSingleChunk(req, chunks[i], i, chunks.size(), num_channels,
+                           expected_chunk_count)) {
+        UCCL_LOG(WARN) << "SendConnection: Failed to send chunk " << i;
       }
     }
   }
@@ -389,6 +601,13 @@ class SendConnection : public RDMAConnection {
     if (unlikely(ctrl_channel_ == nullptr)) {
       return;
     }
+
+    // First, try to drain any pending chunks from a previous request
+    // that was paused due to CC window limits.
+    if (!drainPendingChunks()) {
+      return;  // Still CC-blocked, don't dequeue new requests.
+    }
+
     SendReqMeta meta;
     bool has_meta = false;
     int index = -1;
@@ -398,16 +617,18 @@ class SendConnection : public RDMAConnection {
     // }
     while (has_meta) {
       std::shared_ptr<RDMASendRequest> req;
-      if (tracker_->getTotalInflightBytes() > kInFlightMaxSizeKB * 1024 ||
+      size_t inflight_limit_bytes = currentInflightLimitBytes();
+      if (currentInflightBytes() > inflight_limit_bytes ||
           !request_queue_->pop(req)) {
-        if (tracker_->getTotalInflightBytes() > kInFlightMaxSizeKB * 1024) {
+        if (currentInflightBytes() > inflight_limit_bytes) {
           UCCL_LOG(WARN) << "SendConnection: In-flight bytes exceed "
                             "limit,pausing sending."
-                         << tracker_->getTotalInflightBytes()
-                         << " bytes in-flight.";
+                         << currentInflightBytes() << " bytes in-flight.";
         }
         break;
       }
+      // Register actual packet size now that we are about to send it.
+      tracker_->updatePacketSize(req->wr_id, req->getLocalLen());
       index = ctrl_channel_->getOneSendRequestMeta(meta);
       UCCL_LOG(INFO, UCCL_RDMA)
           << "SendConnection: Processing send request meta: " << meta;
@@ -464,12 +685,29 @@ class SendConnection : public RDMAConnection {
     for (auto& [channel_id, channel] : channels_) {
       std::vector<CQMeta> cq_datas;
       if (channel && channel->pollOnce(cq_datas)) {
+        std::vector<uint64_t> acks;
         for (auto const& cq_data : cq_datas) {
-          // UCCL_LOG(INFO, UCCL_RDMA) << "SendConnection::pollingLoop -
-          // Channel "
-          // << channel_id
-          //           << " polled completion: " << cq_data;
-          tracker_->acknowledge(cq_data.wr_id);
+          // A signaled CQE produced by batched flush represents completion
+          // of itself + all preceding unsignaled WRs on this QP. Expand
+          // the wr_id list accordingly.
+          acks.clear();
+          channel->expandCompletion(cq_data.wr_id, acks);
+          for (uint64_t wid : acks) {
+            if (cc_.enabled()) {
+              // Decode: low 32 bits = message seq (tracker), high 32 = TSC ID
+              uint32_t msg_seq = static_cast<uint32_t>(wid);
+              uint32_t tsc_id = static_cast<uint32_t>(wid >> 32);
+              tracker_->acknowledge(msg_seq);
+              cc_.onAck(tsc_id, cq_data.len);
+              // Decrease per-chunk inflight counter so CC window checks
+              // unblock pending chunks without waiting for the whole message.
+              size_t prev = cc_inflight_bytes_.load(std::memory_order_relaxed);
+              size_t sub = std::min(prev, static_cast<size_t>(cq_data.len));
+              cc_inflight_bytes_.fetch_sub(sub, std::memory_order_relaxed);
+            } else {
+              tracker_->acknowledge(static_cast<uint32_t>(wid));
+            }
+          }
         }
       }
     }

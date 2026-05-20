@@ -14,6 +14,8 @@
 #                                     Example: CONTAINER_ENGINE=apptainer ./build.sh cu12 all
 #   USE_INTEL_RDMA_NIC=1            Enable Intel RDMA NIC support (irdma driver, vendor 0x8086)
 #                                     Example: USE_INTEL_RDMA_NIC=1 ./build.sh cu12 ccl_efa
+#   USE_DMABUF=1                    Enable DMA-BUF GPU memory registration for EP builds
+#                                     Example: USE_DMABUF=1 ./build.sh cu12 ep
 #   UCCL_RETAG_TO_HOST_GLIBC=1      Allow retagging the wheel to the host's
 #                                   glibc version when it differs from the container's.
 #                                   By default the wheel keeps the container's glibc tag.
@@ -106,7 +108,7 @@ if [[ "$BUILD_TYPE" =~ (ep|all|p2p) ]]; then
     if [[ -n "$DETECTED_GPU_ARCH" ]]; then
       msg_info "Auto-detected CUDA compute capability: ${DETECTED_GPU_ARCH}"
     fi
-  elif [[ "$TARGET" == roc[67] ]] && command -v amd-smi &>/dev/null; then
+  elif [[ ( "$TARGET" == roc[67] || "$TARGET" == "therock" ) ]] && command -v amd-smi &>/dev/null; then
     # Check if jq is installed, install via pip if not
     if ! command -v jq &>/dev/null; then
       msg_info "jq not found, installing via pip..."
@@ -388,10 +390,9 @@ if [[ "$CONTAINER_ENGINE" == "apptainer" ]]; then
   fi
 
   for env_var in TARGET PY_VER ARCH ROCM_IDX_URL IS_EFA WHEEL_DIR BUILD_TYPE \
-    USE_TCPX USE_EFA USE_IB USE_TCP USE_DIETGPU USE_INTEL_RDMA_NIC \
-    PER_EXPERT_BATCHING MAKE_NORMAL_MODE TORCH_CUDA_ARCH_LIST \
-    HOST_GLIBC_VER UCCL_RETAG_TO_HOST_GLIBC \
-    UCCL_LOCAL_VERSION; do
+    USE_DIETGPU USE_INTEL_RDMA_NIC USE_DMABUF PER_EXPERT_BATCHING \
+    TORCH_CUDA_ARCH_LIST HOST_GLIBC_VER UCCL_RETAG_TO_HOST_GLIBC \
+    PYTORCH_ROCM_ARCH UCCL_LOCAL_VERSION; do
     value="${!env_var-}"
     CONTAINER_RUN_ARGS+=(--env "$env_var=$value")
   done
@@ -420,14 +421,11 @@ else
     -e IS_EFA="${IS_EFA}" \
     -e WHEEL_DIR="${WHEEL_DIR}" \
     -e BUILD_TYPE="${BUILD_TYPE}" \
-    -e USE_TCPX="${USE_TCPX:-0}" \
-    -e USE_EFA="${USE_EFA:-0}" \
-    -e USE_IB="${USE_IB:-0}" \
-    -e USE_TCP="${USE_TCP:-0}" \
     -e USE_DIETGPU="${USE_DIETGPU:-0}" \
     -e USE_INTEL_RDMA_NIC="${USE_INTEL_RDMA_NIC:-0}" \
+    -e USE_DMABUF="${USE_DMABUF:-0}" \
     -e PER_EXPERT_BATCHING="${PER_EXPERT_BATCHING:-0}" \
-    -e MAKE_NORMAL_MODE="${MAKE_NORMAL_MODE:-}" \
+    -e PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-}" \
     -e TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-}" \
     -e HOST_GLIBC_VER="${HOST_GLIBC_VER}" \
     -e UCCL_RETAG_TO_HOST_GLIBC="${UCCL_RETAG_TO_HOST_GLIBC:-0}" \

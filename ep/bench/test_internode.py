@@ -3,7 +3,6 @@ This is the same test_internode.py test in DeepEP's repo.
 
 Build:
 export OMP_NUM_THREADS=6
-export MAKE_NORMAL_MODE=1
 make clean && make -j install
 
 On first node:
@@ -260,7 +259,7 @@ def test_main(
                     )
 
                     # Checks
-                    recv_gbl_rank_prefix_sum = handle[-4]
+                    recv_gbl_rank_prefix_sum = handle[-6]
                     assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
                         0
                     ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"

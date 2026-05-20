@@ -55,8 +55,7 @@ struct ExecutorConfig {
 };
 
 PlanRequest make_plan_request(CollectiveKind kind,
-                              CollectiveConfig const& config,
-                              CollectiveBufferRoles const& roles);
+                              CollectiveConfig const& config, bool inplace);
 
 struct CollectiveOpHandle {
   uint64_t value = 0;
@@ -71,6 +70,7 @@ class Executor {
   // successor ops.
   explicit Executor(
       ExecutorBackends backends,
+      // Callback contract: second argument is remote `buffer_id` (not MR id).
       std::function<bool(int, uint32_t, size_t, size_t, void**, int*)>
           resolve_ipc_buffer_pointer = {});
   Executor(ExecutorConfig const& config = {});

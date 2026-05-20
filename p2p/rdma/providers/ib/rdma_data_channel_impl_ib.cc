@@ -8,7 +8,6 @@
 #include <cstring>
 
 #define GID_INDEX_DEFAULT 3
-#define MAX_INLINE_DATA 128
 #define SERVICE_LEVEL 3
 #define MIN_RNR_TIMER 12
 #define TRAFFIC_CLASS 104
@@ -18,12 +17,13 @@
 #define TIMEOUT 14
 #define MAX_RD_ATOMIC 1
 #define MAX_DEST_RD_ATOMIC 1
-#define MAX_CQE 1024
+static constexpr int kMaxCqe = kMaxSendWr + kMaxRecvWr;
+static constexpr uint64_t kRecvWrIdMask = 1ull << 63;
 
 inline void IBChannelImpl::initQP(std::shared_ptr<RdmaContext> ctx,
                                   struct ibv_cq_ex** cq_ex, struct ibv_qp** qp,
                                   ChannelMetaData* local_meta) {
-  *cq_ex = (struct ibv_cq_ex*)ibv_create_cq(ctx->getCtx(), MAX_CQE, nullptr,
+  *cq_ex = (struct ibv_cq_ex*)ibv_create_cq(ctx->getCtx(), kMaxCqe, nullptr,
                                             nullptr, 0);
   assert(*cq_ex);
 
@@ -45,7 +45,7 @@ inline void IBChannelImpl::initQP(std::shared_ptr<RdmaContext> ctx,
   qp_attr.cap.max_recv_wr = kMaxRecvWr;
   qp_attr.cap.max_send_sge = kMaxSendSeg;
   qp_attr.cap.max_recv_sge = kMaxRecvSeg;
-  qp_attr.cap.max_inline_data = getMaxInlineData();
+  qp_attr.cap.max_inline_data = 0;
 
   qp_attr.send_cq = ibv_cq_ex_to_cq(*cq_ex);
   qp_attr.recv_cq = ibv_cq_ex_to_cq(*cq_ex);
@@ -65,9 +65,14 @@ inline void IBChannelImpl::initQP(std::shared_ptr<RdmaContext> ctx,
   attr.pkey_index = 0;
   attr.qp_access_flags =
       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-  assert(ibv_modify_qp(*qp, &attr,
-                       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-                           IBV_QP_ACCESS_FLAGS) == 0);
+  int const init_qp_rc = ibv_modify_qp(
+      *qp, &attr,
+      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+  if (unlikely(init_qp_rc != 0)) {
+    UCCL_LOG(ERROR) << "ibv_modify_qp INIT failed, rc=" << init_qp_rc
+                    << ", errno=" << errno << " (" << strerror(errno) << ")";
+    throw std::runtime_error("ibv_modify_qp INIT failed");
+  }
 
   local_meta->gid = ctx->detectGid(GID_INDEX_DEFAULT);
   local_meta->qpn = (*qp)->qp_num;
@@ -86,7 +91,12 @@ inline void IBChannelImpl::ibrcQP_rtr_rts(struct ibv_qp* qp,
   int flags = 0;
   struct ibv_qp_attr attr = {};
   struct ibv_port_attr port_attr;
-  assert(ibv_query_port(ctx->getCtx(), kPortNum, &port_attr) == 0);
+  int const query_port_rc = ibv_query_port(ctx->getCtx(), kPortNum, &port_attr);
+  if (unlikely(query_port_rc != 0)) {
+    UCCL_LOG(ERROR) << "ibv_query_port failed, rc=" << query_port_rc
+                    << ", errno=" << errno << " (" << strerror(errno) << ")";
+    throw std::runtime_error("ibv_query_port failed");
+  }
 
   // RTR
   memset(&attr, 0, sizeof(attr));
@@ -122,7 +132,12 @@ inline void IBChannelImpl::ibrcQP_rtr_rts(struct ibv_qp* qp,
 
   flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV;
-  assert(ibv_modify_qp(qp, &attr, flags) == 0);
+  int const rtr_rc = ibv_modify_qp(qp, &attr, flags);
+  if (unlikely(rtr_rc != 0)) {
+    UCCL_LOG(ERROR) << "ibv_modify_qp RTR failed, rc=" << rtr_rc
+                    << ", errno=" << errno << " (" << strerror(errno) << ")";
+    throw std::runtime_error("ibv_modify_qp RTR failed");
+  }
 
   lazyPostRecvWrsN(qp, kMaxRecvWr, true);
 
@@ -136,7 +151,12 @@ inline void IBChannelImpl::ibrcQP_rtr_rts(struct ibv_qp* qp,
   attr.max_rd_atomic = MAX_RD_ATOMIC;
   flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-  assert(ibv_modify_qp(qp, &attr, flags) == 0);
+  int const rts_rc = ibv_modify_qp(qp, &attr, flags);
+  if (unlikely(rts_rc != 0)) {
+    UCCL_LOG(ERROR) << "ibv_modify_qp RTS failed, rc=" << rts_rc
+                    << ", errno=" << errno << " (" << strerror(errno) << ")";
+    throw std::runtime_error("ibv_modify_qp RTS failed");
+  }
 }
 
 inline bool IBChannelImpl::pollOnce(struct ibv_cq_ex* cq_ex,
@@ -165,7 +185,12 @@ inline bool IBChannelImpl::pollOnce(struct ibv_cq_ex* cq_ex,
     if (unlikely(status != IBV_WC_SUCCESS)) {
       UCCL_LOG(WARN) << "pollOnce - channel_id: " << channel_id
                      << ", CQE error, wr_id=" << wr_id << ", status=" << status
-                     << " (" << ibv_wc_status_str(status) << ")";
+                     << " (" << ibv_wc_status_str(status) << ")"
+                     << ", opcode=" << wc->opcode
+                     << ", byte_len=" << wc->byte_len << ", vendor_err=0x"
+                     << std::hex << wc->vendor_err << ", qp_num=0x"
+                     << wc->qp_num << ", wc_flags=0x" << wc->wc_flags
+                     << std::dec;
     } else {
       CQMeta cq_data{};
       cq_data.wr_id = wr_id;
@@ -192,7 +217,12 @@ inline void IBChannelImpl::lazyPostRecvWrsN(struct ibv_qp* qp, uint32_t n,
   while (pending_post_recv_ >= kBatchPostRecvWr) {
     struct ibv_recv_wr* bad_wr = nullptr;
     pre_alloc_recv_wrs_[kBatchPostRecvWr - 1].next = nullptr;
-    assert(ibv_post_recv(qp, pre_alloc_recv_wrs_, &bad_wr) == 0);
+    int const post_recv_rc = ibv_post_recv(qp, pre_alloc_recv_wrs_, &bad_wr);
+    if (unlikely(post_recv_rc != 0)) {
+      UCCL_LOG(ERROR) << "ibv_post_recv failed, rc=" << post_recv_rc
+                      << ", errno=" << errno << " (" << strerror(errno) << ")";
+      throw std::runtime_error("ibv_post_recv failed");
+    }
     pre_alloc_recv_wrs_[kBatchPostRecvWr - 1].next =
         (kBatchPostRecvWr == kMaxRecvWr)
             ? nullptr
@@ -203,7 +233,12 @@ inline void IBChannelImpl::lazyPostRecvWrsN(struct ibv_qp* qp, uint32_t n,
   if (force && pending_post_recv_) {
     struct ibv_recv_wr* bad_wr = nullptr;
     pre_alloc_recv_wrs_[pending_post_recv_ - 1].next = nullptr;
-    assert(ibv_post_recv(qp, pre_alloc_recv_wrs_, &bad_wr) == 0);
+    int const post_recv_rc = ibv_post_recv(qp, pre_alloc_recv_wrs_, &bad_wr);
+    if (unlikely(post_recv_rc != 0)) {
+      UCCL_LOG(ERROR) << "ibv_post_recv failed, rc=" << post_recv_rc
+                      << ", errno=" << errno << " (" << strerror(errno) << ")";
+      throw std::runtime_error("ibv_post_recv failed");
+    }
     pre_alloc_recv_wrs_[pending_post_recv_ - 1].next =
         (pending_post_recv_ == kMaxRecvWr)
             ? nullptr
@@ -226,13 +261,10 @@ inline void IBChannelImpl::initPreAllocResources() {
   pending_post_recv_ = 0;
   for (int i = 0; i < kMaxRecvWr; i++) {
     pre_alloc_recv_wrs_[i] = {};
+    pre_alloc_recv_wrs_[i].wr_id = kRecvWrIdMask | static_cast<uint64_t>(i);
     pre_alloc_recv_wrs_[i].next =
         (i == kMaxRecvWr - 1) ? nullptr : &pre_alloc_recv_wrs_[i + 1];
   }
-}
-
-inline uint32_t IBChannelImpl::getMaxInlineData() const {
-  return MAX_INLINE_DATA;
 }
 
 #endif  // RDMA_DATA_CHANNEL_IMPL_IB_CC_INCLUDED

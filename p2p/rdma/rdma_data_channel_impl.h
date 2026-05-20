@@ -80,23 +80,17 @@ class RDMADataChannelImpl {
   virtual void setDstAddress(struct ibv_qp_ex* qpx, struct ibv_ah* ah,
                              uint32_t remote_qpn) = 0;
 
-  // Get max inline data size
-  virtual uint32_t getMaxInlineData() const = 0;
-
   // Initialize pre-allocated resources
   virtual void initPreAllocResources() = 0;
 
  protected:
-  struct ibv_recv_wr* pre_alloc_recv_wrs_;
-  uint32_t pending_post_recv_;
+  struct ibv_recv_wr* pre_alloc_recv_wrs_ = nullptr;
+  uint32_t pending_post_recv_ = 0;
 };
 
 // Forward declarations for implementations
-#ifdef UCCL_P2P_USE_EFA
 class EFAChannelImpl;
-#else
 class IBChannelImpl;
-#endif
 
 // Factory function declaration (defined in rdma_data_channel.h after
 // including provider headers)
